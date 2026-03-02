@@ -5134,7 +5134,10 @@
         if (stats) {
           const formatTokens = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 
-          let parts = [`${stats.messageCount} msgs`, `${stats.factCount} facts`];
+          let parts = [`${stats.messageCount} msgs`];
+          if (currentAgentMode !== 'coder') {
+            parts.push(`${stats.factCount} facts`);
+          }
           if (stats.contextTokens != null && stats.contextWindow) {
             parts.push(`${formatTokens(stats.contextTokens)} / ${formatTokens(stats.contextWindow)} context`);
           }

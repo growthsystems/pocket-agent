@@ -469,6 +469,8 @@ export class ChatEngine {
         tokensUsed: totalInputTokens + totalOutputTokens,
         wasCompacted,
         media: this.pendingMedia.length > 0 ? this.pendingMedia : undefined,
+        contextTokens: totalInputTokens + totalCacheRead + totalCacheCreation,
+        contextWindow: 200000,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);

@@ -513,7 +513,15 @@ class AgentManagerClass extends EventEmitter {
     // Route by per-session mode (not global mode)
     const sessionMode = this.memory.getSessionMode(sessionId);
     if (sessionMode === 'general' && this.chatEngine) {
-      return this.chatEngine.processMessage(userMessage, channel, sessionId, images, attachmentInfo);
+      const result = await this.chatEngine.processMessage(userMessage, channel, sessionId, images, attachmentInfo);
+      // Store context usage for stats display
+      if (result.contextTokens !== undefined || result.contextWindow !== undefined) {
+        this.contextUsageBySession.set(sessionId, {
+          contextTokens: result.contextTokens ?? 0,
+          contextWindow: result.contextWindow ?? 0,
+        });
+      }
+      return result;
     }
 
     // If already processing, queue the message
