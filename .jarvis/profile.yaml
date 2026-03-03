@@ -1,0 +1,12 @@
+project: pocket-agent
+repo: vasanth/pocket-agent
+stack:
+  - better-sqlite3
+  - electron
+  - typescript
+ci: github-actions
+contacts:
+  - name: Vasanth
+    role: owner
+key_paths:
+  src: src/

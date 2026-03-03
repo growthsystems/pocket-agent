@@ -24,6 +24,7 @@ import { isMacOS, getPermissionsStatus, openPermissionSettings } from '../permis
 import type { PermissionType } from '../permissions';
 import { initializeUpdater, setupUpdaterIPC, setSettingsWindow } from './updater';
 import cityTimezones from 'city-timezones';
+import { startNotifyServer, setNotifyHandler, setMemoryQueryHandler, stopNotifyServer } from '../notify-server';
 
 // Handle EPIPE errors gracefully (happens when stdout pipe is closed)
 process.stdout?.on('error', (err: Error & { code?: string }) => {
@@ -2732,6 +2733,39 @@ async function initializeAgent(): Promise<void> {
     }
   }
 
+  // Start Jarvis notification relay endpoint (port 4002)
+  startNotifyServer();
+  setNotifyHandler((notification) => {
+    // Show as native desktop notification
+    showNotification(notification.title, notification.body);
+
+    // Forward to Telegram if connected
+    if (telegramBot) {
+      const icon = notification.urgency === 'high' ? '\u{1F6A8}' : notification.type === 'error' ? '\u{274C}' : '\u{2139}\u{FE0F}';
+      telegramBot.broadcast(`${icon} ${notification.title}\n${notification.body}`).catch((err) => {
+        console.error('[Notify] Telegram broadcast failed:', err);
+      });
+    }
+  });
+
+  // Wire MemoryManager to notify server for Jarvis context enrichment
+  if (memory) {
+    const mem = memory; // capture for closure
+    setMemoryQueryHandler(() => ({
+      context: {
+        facts: mem.getFactsForContext(),
+        dailyLogs: mem.getDailyLogsContext(3),
+      },
+      history: (limit: number) => {
+        const sessions = mem.getSessions();
+        const sessionId = sessions.length > 0 ? sessions[0].id : 'default';
+        const messages = mem.getRecentMessages(limit, sessionId);
+        return { messages, session_id: sessionId };
+      },
+    }));
+    console.log('[Main] Memory query handler registered for /api/context and /api/history');
+  }
+
   console.log('[Main] Pocket Agent initialized');
   updateTrayMenu();
 }
@@ -2749,6 +2783,8 @@ async function stopAgent(): Promise<void> {
     scheduler.stopAll();
     scheduler = null;
   }
+  // Stop notify server
+  stopNotifyServer();
   // Cleanup browser resources
   AgentManager.cleanup();
   console.log('[Main] Agent stopped');

@@ -21,6 +21,9 @@ import {
   handleNotifyTool,
 } from './macos';
 import { getProjectTools } from './project-tools';
+import { getJarvisTools } from './jarvis-tools';
+import { getSlackTools } from './slack-tools';
+import { getMcTools } from './mc-tools';
 import { wrapToolHandler, getToolTimeout, logActiveToolsStatus } from './diagnostics';
 
 export { logActiveToolsStatus } from './diagnostics';
@@ -337,6 +340,78 @@ export async function buildSdkMcpServers(
       tools.push(sdkTool);
     }
 
+    // Jarvis automation tools (with diagnostics wrapper)
+    const jarvisTools = getJarvisTools();
+    for (const jTool of jarvisTools) {
+      const wrappedHandler = wrapToolHandler(jTool.name, jTool.handler, getToolTimeout(jTool.name));
+      const sdkTool = tool(
+        jTool.name,
+        jTool.description,
+        Object.fromEntries(
+          Object.entries(jTool.input_schema.properties || {}).map(([key, value]: [string, unknown]) => {
+            const prop = value as { type?: string };
+            if (prop.type === 'string') return [key, z.string().optional()];
+            if (prop.type === 'number') return [key, z.number().optional()];
+            if (prop.type === 'boolean') return [key, z.boolean().optional()];
+            return [key, z.any().optional()];
+          })
+        ),
+        async (args) => {
+          const result = await wrappedHandler(args);
+          return { content: [{ type: 'text', text: result }] };
+        }
+      );
+      tools.push(sdkTool);
+    }
+
+    // Slack communication tools (with diagnostics wrapper)
+    const slackTools = getSlackTools();
+    for (const sTool of slackTools) {
+      const wrappedHandler = wrapToolHandler(sTool.name, sTool.handler, getToolTimeout(sTool.name));
+      const sdkTool = tool(
+        sTool.name,
+        sTool.description,
+        Object.fromEntries(
+          Object.entries(sTool.input_schema.properties || {}).map(([key, value]: [string, unknown]) => {
+            const prop = value as { type?: string };
+            if (prop.type === 'string') return [key, z.string().optional()];
+            if (prop.type === 'number') return [key, z.number().optional()];
+            if (prop.type === 'boolean') return [key, z.boolean().optional()];
+            return [key, z.any().optional()];
+          })
+        ),
+        async (args) => {
+          const result = await wrappedHandler(args);
+          return { content: [{ type: 'text', text: result }] };
+        }
+      );
+      tools.push(sdkTool);
+    }
+
+    // Mission Control task tools (with diagnostics wrapper)
+    const mcTools = getMcTools();
+    for (const mcTool of mcTools) {
+      const wrappedHandler = wrapToolHandler(mcTool.name, mcTool.handler, getToolTimeout(mcTool.name));
+      const sdkTool = tool(
+        mcTool.name,
+        mcTool.description,
+        Object.fromEntries(
+          Object.entries(mcTool.input_schema.properties || {}).map(([key, value]: [string, unknown]) => {
+            const prop = value as { type?: string; enum?: string[] };
+            if (prop.type === 'string') return [key, z.string().optional()];
+            if (prop.type === 'number') return [key, z.number().optional()];
+            if (prop.type === 'boolean') return [key, z.boolean().optional()];
+            return [key, z.any().optional()];
+          })
+        ),
+        async (args) => {
+          const result = await wrappedHandler(args);
+          return { content: [{ type: 'text', text: result }] };
+        }
+      );
+      tools.push(sdkTool);
+    }
+
     // Create the SDK MCP server
     const server = createSdkMcpServer({
       name: 'pocket-agent-tools',
@@ -445,6 +520,39 @@ export function getCustomTools(config: ToolsConfig): Array<{
   // Project tools
   const projectTools = getProjectTools();
   for (const tool of projectTools) {
+    tools.push({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema as Record<string, unknown>,
+      handler: tool.handler,
+    });
+  }
+
+  // Jarvis automation tools
+  const jarvisTools = getJarvisTools();
+  for (const tool of jarvisTools) {
+    tools.push({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema as Record<string, unknown>,
+      handler: tool.handler,
+    });
+  }
+
+  // Slack communication tools
+  const slackTools = getSlackTools();
+  for (const tool of slackTools) {
+    tools.push({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema as Record<string, unknown>,
+      handler: tool.handler,
+    });
+  }
+
+  // Mission Control task tools
+  const mcTools = getMcTools();
+  for (const tool of mcTools) {
     tools.push({
       name: tool.name,
       description: tool.description,

@@ -11,6 +11,27 @@ import type { TelegramBot } from '../channels/telegram';
  */
 export const HEARTBEAT_OK = 'HEARTBEAT_OK';
 
+/**
+ * Jarvis daemon endpoint for event ingestion.
+ * Jarvis listens on localhost:4001 and accepts POST /event.
+ */
+const JARVIS_EVENT_URL = 'http://localhost:4001/event';
+
+/**
+ * Maps Pocket Agent cron job names to Jarvis event types.
+ * When a job with a matching name completes, the scheduler fires
+ * the corresponding event to Jarvis so its chain can execute.
+ *
+ * Source: jarvis/config/cron-triggers.yaml
+ */
+const JARVIS_CRON_MAP: Record<string, string> = {
+  'morning-briefing': 'cron.morning',
+  'nightly-digest': 'cron.nightly',
+  'weekly-review': 'cron.weekly',
+  'content-check': 'cron.content-check',
+  'health-check': 'cron.health',
+};
+
 interface CalendarEvent {
   id: number;
   title: string;
@@ -80,6 +101,47 @@ export class CronScheduler {
   private isCheckingReminders: boolean = false; // Mutex to prevent overlapping checks
 
   constructor() {}
+
+  /**
+   * Fire an event to Jarvis daemon (fire-and-forget).
+   * Never blocks or throws — Jarvis being offline should not affect PA scheduler.
+   */
+  private fireJarvisEvent(jobName: string, payload: Record<string, unknown> = {}): void {
+    const eventType = JARVIS_CRON_MAP[jobName];
+    if (!eventType) return; // No mapping for this job — skip silently
+
+    const event = {
+      id: `pa-cron-${jobName}-${Date.now()}`,
+      source: 'cron',
+      type: eventType,
+      payload: {
+        ...payload,
+        origin: 'pocket-agent',
+        jobName,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    // Fire-and-forget: don't await, don't block, don't throw
+    fetch(JARVIS_EVENT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(5000), // 5s timeout
+    })
+      .then((res) => {
+        if (res.status === 202) {
+          console.log(`[Scheduler] Jarvis event fired: ${eventType} (${event.id})`);
+        } else {
+          console.warn(`[Scheduler] Jarvis returned ${res.status} for event ${eventType}`);
+        }
+      })
+      .catch((err) => {
+        // Jarvis might be offline — log and move on
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        console.warn(`[Scheduler] Jarvis unreachable for ${eventType}: ${msg}`);
+      });
+  }
 
   /**
    * Initialize scheduler with memory manager and load jobs
@@ -352,6 +414,9 @@ export class CronScheduler {
         // For reminders, don't show prompt (the response IS the message)
         const displayPrompt = job.job_type === 'reminder' ? '' : job.prompt;
         await this.routeJobResponse(job.name, displayPrompt, response, job.channel, sessionId);
+
+        // Fire corresponding Jarvis event (if mapped)
+        this.fireJarvisEvent(job.name);
 
         this.addToHistory({
           jobName: job.name,
@@ -690,6 +755,9 @@ export class CronScheduler {
 
       result.response = agentResult.response;
       result.success = true;
+
+      // Fire corresponding Jarvis event (if mapped)
+      this.fireJarvisEvent(job.name);
 
       // Route response to channel
       await this.routeResponse(job, result.response);
