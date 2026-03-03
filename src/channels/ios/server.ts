@@ -45,6 +45,7 @@ import {
   iOSAppInfoHandler,
   iOSModeGetHandler,
   iOSModeSwitchHandler,
+  iOSWorkflowsHandler,
   iOSCalendarListHandler, iOSCalendarAddHandler, iOSCalendarDeleteHandler, iOSCalendarUpcomingHandler,
   iOSTasksListHandler, iOSTasksAddHandler, iOSTasksCompleteHandler, iOSTasksDeleteHandler, iOSTasksDueHandler,
   iOSChatInfoHandler,
@@ -94,6 +95,7 @@ export class iOSWebSocketServer {
   private onSkinSet: ((skinId: string) => void) | null = null;
   private onGetMode: iOSModeGetHandler | null = null;
   private onSwitchMode: iOSModeSwitchHandler | null = null;
+  private onGetWorkflows: iOSWorkflowsHandler | null = null;
   private onCalendarList: iOSCalendarListHandler | null = null;
   private onCalendarAdd: iOSCalendarAddHandler | null = null;
   private onCalendarDelete: iOSCalendarDeleteHandler | null = null;
@@ -197,6 +199,7 @@ export class iOSWebSocketServer {
   setSkinHandler(handler: (skinId: string) => void): void { this.onSkinSet = handler; }
   setModeGetHandler(handler: iOSModeGetHandler): void { this.onGetMode = handler; }
   setModeSwitchHandler(handler: iOSModeSwitchHandler): void { this.onSwitchMode = handler; }
+  setWorkflowsHandler(handler: iOSWorkflowsHandler): void { this.onGetWorkflows = handler; }
   setCalendarListHandler(handler: iOSCalendarListHandler): void { this.onCalendarList = handler; }
   setCalendarAddHandler(handler: iOSCalendarAddHandler): void { this.onCalendarAdd = handler; }
   setCalendarDeleteHandler(handler: iOSCalendarDeleteHandler): void { this.onCalendarDelete = handler; }
@@ -519,8 +522,10 @@ export class iOSWebSocketServer {
           }
 
           case 'workflows:list': {
-            const commands = loadWorkflowCommands();
-            const workflows = commands.map(c => ({ name: c.name, description: c.description, content: c.content }));
+            const wfSessionId = client.device.sessionId || 'default';
+            const workflows = this.onGetWorkflows
+              ? this.onGetWorkflows(wfSessionId)
+              : loadWorkflowCommands().map(c => ({ name: c.name, description: c.description, content: c.content }));
             ws.send(JSON.stringify({ type: 'workflows', workflows }));
             break;
           }
@@ -609,16 +614,20 @@ export class iOSWebSocketServer {
             break;
           }
           case 'customize:get': {
-            const customize = this.onGetCustomize?.() || { identity: '', instructions: '' };
+            const customize = this.onGetCustomize?.() || { agentName: 'Frankie', personality: '', goals: '', struggles: '', funFacts: '', systemGuidelines: '' };
             ws.send(JSON.stringify({ type: 'customize', ...customize }));
             break;
           }
           case 'customize:save': {
-            const identity = 'identity' in message ? (message as { identity: string }).identity : undefined;
-            const instructions = 'instructions' in message ? (message as { instructions: string }).instructions : undefined;
-            const profile = 'profile' in message ? (message as { profile: { name?: string; occupation?: string; location?: string; timezone?: string; birthday?: string; custom?: string } }).profile : undefined;
-            this.onSaveCustomize?.(identity, instructions, profile);
-            const updated = this.onGetCustomize?.() || { identity: '', instructions: '' };
+            const saveData: Record<string, unknown> = {};
+            if ('agentName' in message) saveData.agentName = (message as { agentName: string }).agentName;
+            if ('personality' in message) saveData.personality = (message as { personality: string }).personality;
+            if ('goals' in message) saveData.goals = (message as { goals: string }).goals;
+            if ('struggles' in message) saveData.struggles = (message as { struggles: string }).struggles;
+            if ('funFacts' in message) saveData.funFacts = (message as { funFacts: string }).funFacts;
+            if ('profile' in message) saveData.profile = (message as { profile: Record<string, string> }).profile;
+            this.onSaveCustomize?.(saveData as Parameters<NonNullable<typeof this.onSaveCustomize>>[0]);
+            const updated = this.onGetCustomize?.() || { agentName: 'Frankie', personality: '', goals: '', struggles: '', funFacts: '', systemGuidelines: '' };
             ws.send(JSON.stringify({ type: 'customize', ...updated }));
             break;
           }
@@ -753,8 +762,7 @@ export class iOSWebSocketServer {
           }
           case 'chat:info': {
             const info = this.onChatInfo?.() || { username: '', adminKey: '' };
-            // Never send adminKey to clients — only send the username
-            ws.send(JSON.stringify({ type: 'chat:info', username: info.username }));
+            ws.send(JSON.stringify({ type: 'chat:info', username: info.username, adminKey: info.adminKey }));
             break;
           }
         }
@@ -814,6 +822,7 @@ export class iOSWebSocketServer {
         tokensUsed: result.tokensUsed,
         media: result.media,
         timestamp: new Date().toISOString(),
+        planPending: result.planPending,
       };
       client.ws.send(JSON.stringify(response));
     } catch (error) {

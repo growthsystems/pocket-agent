@@ -12,10 +12,9 @@ import type { ConnectedDevice, ClientChatMessage } from '../channels/ios/types';
 import { transcribeAudio } from '../utils/transcribe';
 import { SettingsManager, SETTINGS_SCHEMA } from '../settings';
 import { THEMES } from '../settings/themes';
-import { loadIdentity, saveIdentity, getIdentityPath, DEFAULT_IDENTITY } from '../config/identity';
-import { loadInstructions, saveInstructions, getInstructionsPath, DEFAULT_INSTRUCTIONS } from '../config/instructions';
+import { SYSTEM_GUIDELINES } from '../config/system-guidelines';
 import { DEFAULT_COMMANDS } from '../config/commands';
-import { loadWorkflowCommands } from '../config/commands-loader';
+import { loadWorkflowCommands, loadWorkflowCommandsFromDir } from '../config/commands-loader';
 import { closeTaskDb } from '../tools';
 import { handleCalendarListTool, handleCalendarAddTool, handleCalendarDeleteTool, handleCalendarUpcomingTool } from '../tools/calendar-tools';
 import { handleTaskListTool, handleTaskAddTool, handleTaskCompleteTool, handleTaskDeleteTool, handleTaskDueTool } from '../tools/task-tools';
@@ -312,9 +311,160 @@ function getAgentWorkspace(): string {
 }
 
 /**
+ * Create a per-session working directory for Coder mode.
+ * Creates ~/Documents/Pocket-agent/<sessionName>/ and populates
+ * .claude/commands/ with coder-specific commands from bundled assets.
+ * Does NOT copy CLAUDE.md — coder mode uses the project's own CLAUDE.md
+ * via the SDK's settingSources: ['project'] + cwd.
+ */
+function createSessionDirectory(sessionName: string): string {
+  const workspace = getAgentWorkspace();
+  const sessionDir = path.join(workspace, sessionName);
+
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+    console.log(`[Main] Created session directory: ${sessionDir}`);
+  }
+
+  // Always sync coder commands from bundled assets (overwrites stale commands from older versions)
+  const coderCommandsSource = path.join(__dirname, '../../assets/coder-commands');
+  const sessionCommandsDir = path.join(sessionDir, '.claude', 'commands');
+  if (fs.existsSync(coderCommandsSource)) {
+    fs.mkdirSync(sessionCommandsDir, { recursive: true });
+    // Remove old commands that aren't in the bundled set
+    const bundledFiles = new Set(fs.readdirSync(coderCommandsSource).filter(f => f.endsWith('.md')));
+    if (fs.existsSync(sessionCommandsDir)) {
+      for (const file of fs.readdirSync(sessionCommandsDir).filter(f => f.endsWith('.md'))) {
+        if (!bundledFiles.has(file)) {
+          fs.unlinkSync(path.join(sessionCommandsDir, file));
+        }
+      }
+    }
+    // Copy all bundled coder commands
+    for (const file of bundledFiles) {
+      fs.copyFileSync(path.join(coderCommandsSource, file), path.join(sessionCommandsDir, file));
+    }
+    console.log(`[Main] Synced ${bundledFiles.size} coder commands to session directory`);
+  }
+
+  return sessionDir;
+}
+
+/**
+ * Rename a session directory on disk.
+ * Returns the new absolute path, or null if the target already exists.
+ */
+function renameSessionDirectory(oldPath: string, newName: string): string | null {
+  const parentDir = path.dirname(oldPath);
+  const newPath = path.join(parentDir, newName);
+
+  if (fs.existsSync(newPath)) {
+    console.warn(`[Main] Cannot rename session directory: target exists: ${newPath}`);
+    return null;
+  }
+
+  if (fs.existsSync(oldPath)) {
+    fs.renameSync(oldPath, newPath);
+    console.log(`[Main] Renamed session directory: ${oldPath} -> ${newPath}`);
+  } else {
+    // Old directory doesn't exist — create the new one fresh
+    return createSessionDirectory(newName);
+  }
+
+  return newPath;
+}
+
+/**
+ * Ensure a coder session has a working directory.
+ * Called lazily on first message so directories aren't created for sessions
+ * where the user switches to general before sending anything.
+ */
+function ensureCoderWorkingDirectory(sessionId: string): void {
+  if (!memory) return;
+  const sessionMode = memory.getSessionMode(sessionId);
+  const sessionWorkDir = memory.getSessionWorkingDirectory(sessionId);
+  if (sessionMode === 'coder' && !sessionWorkDir) {
+    const session = memory.getSession(sessionId);
+    if (session) {
+      const workingDirectory = createSessionDirectory(session.name);
+      memory.setSessionWorkingDirectory(sessionId, workingDirectory);
+      console.log(`[Sessions] Lazy-created working directory for coder session: ${workingDirectory}`);
+    }
+  }
+}
+
+/**
+ * Migrate identity.md content into personalize.* SQLite settings.
+ * One-time migration: parses agent name from heading, extracts personality sections,
+ * migrates profile.custom to personalize.world, renames identity.md to .migrated.
+ */
+function migratePersonalizeFromIdentity(): void {
+  if (SettingsManager.get('personalize._migrated')) return;
+
+  const workspace = getAgentWorkspace();
+  const identityPath = path.join(workspace, 'identity.md');
+
+  try {
+    if (fs.existsSync(identityPath)) {
+      const content = fs.readFileSync(identityPath, 'utf-8');
+
+      // Parse agent name from "# Name" heading
+      const nameMatch = content.match(/^#\s+(.+?)(?:\s+the\s+\w+)?$/m);
+      if (nameMatch) {
+        const rawName = nameMatch[1].trim();
+        // Only set if it differs from default
+        if (rawName && rawName !== 'Franky the Cat') {
+          SettingsManager.set('personalize.agentName', rawName);
+          console.log(`[Migration] Set agent name: ${rawName}`);
+        }
+      }
+
+      // Extract personality: everything from ## Vibe through ## Don't section
+      const vibeMatch = content.match(/## Vibe[\s\S]*?(?=\n##[^#]|$)/);
+      const dontMatch = content.match(/## Don't[\s\S]*?(?=\n##[^#]|$)/);
+      if (vibeMatch || dontMatch) {
+        const parts: string[] = [];
+        if (vibeMatch) parts.push(vibeMatch[0].trim());
+        if (dontMatch) parts.push(dontMatch[0].trim());
+        const personality = parts.join('\n\n');
+        SettingsManager.set('personalize.personality', personality);
+        console.log(`[Migration] Set personality: ${personality.length} chars`);
+      }
+
+      // Rename identity.md
+      fs.renameSync(identityPath, identityPath + '.migrated');
+      console.log('[Migration] Renamed identity.md → identity.md.migrated');
+    }
+
+    // Migrate profile.custom → personalize.funFacts
+    const profileCustom = SettingsManager.get('profile.custom');
+    if (profileCustom) {
+      SettingsManager.set('personalize.funFacts', profileCustom);
+      SettingsManager.delete('profile.custom');
+      console.log(`[Migration] Moved profile.custom → personalize.funFacts: ${profileCustom.length} chars`);
+    }
+
+    // Migrate old personalize.world (from earlier migration) → personalize.funFacts
+    const oldWorld = SettingsManager.get('personalize.world');
+    if (oldWorld) {
+      const existing = SettingsManager.get('personalize.funFacts');
+      SettingsManager.set('personalize.funFacts', existing ? `${existing}\n\n${oldWorld}` : oldWorld);
+      SettingsManager.delete('personalize.world');
+      console.log(`[Migration] Moved personalize.world → personalize.funFacts: ${oldWorld.length} chars`);
+    }
+  } catch (err) {
+    console.error('[Migration] Personalize migration failed:', err);
+  }
+
+  // Set flag regardless of success to prevent re-running
+  SettingsManager.set('personalize._migrated', 'true');
+  console.log('[Migration] Personalize migration complete');
+}
+
+/**
  * Ensure the agent workspace directory exists.
  * Creates it if missing (on first run, after onboarding, or if deleted).
- * Sets up CLAUDE.md and .claude/commands for the SDK to load.
+ * Sets up .claude/commands for workflow commands.
  */
 function ensureAgentWorkspace(): string {
   const workspace = getAgentWorkspace();
@@ -344,8 +494,6 @@ function ensureAgentWorkspace(): string {
 
   // Repopulate config files on version update
   if (isVersionUpdate) {
-    const identityPath = path.join(workspace, 'identity.md');
-    const claudeMdPath = path.join(workspace, 'CLAUDE.md');
     const backupDir = path.join(workspace, '.backups');
 
     // Create backup directory
@@ -353,26 +501,8 @@ function ensureAgentWorkspace(): string {
       fs.mkdirSync(backupDir, { recursive: true });
     }
 
-    // Identity: only create if missing — never overwrite user customizations
-    if (fs.existsSync(identityPath)) {
-      // Save a backup of the latest defaults so users can reference what changed
-      const defaultsBackup = path.join(backupDir, `identity-defaults-${currentVersion}.md`);
-      fs.writeFileSync(defaultsBackup, DEFAULT_IDENTITY);
-      console.log(`[Main] Saved default identity.md for reference: ${defaultsBackup}`);
-    } else {
-      fs.writeFileSync(identityPath, DEFAULT_IDENTITY);
-      console.log('[Main] Created identity.md with defaults (first install)');
-    }
-
-    // Instructions: only create if missing — never overwrite user customizations
-    if (fs.existsSync(claudeMdPath)) {
-      const defaultsBackup = path.join(backupDir, `CLAUDE-defaults-${currentVersion}.md`);
-      fs.writeFileSync(defaultsBackup, DEFAULT_INSTRUCTIONS);
-      console.log(`[Main] Saved default CLAUDE.md for reference: ${defaultsBackup}`);
-    } else {
-      fs.writeFileSync(claudeMdPath, DEFAULT_INSTRUCTIONS);
-      console.log('[Main] Created CLAUDE.md with defaults (first install)');
-    }
+    // identity.md and CLAUDE.md are no longer managed here.
+    // Personalize settings are in SQLite. Coder mode generates its own CLAUDE.md per session.
 
     // Populate default workflow commands
     // If .claude is a symlink from a previous install, replace it with a real directory
@@ -1194,6 +1324,9 @@ function setupIPC(): void {
     AgentManager.on('status', statusHandler);
 
     try {
+      // Lazy working directory creation: only create when first message is sent in coder mode
+      ensureCoderWorkingDirectory(effectiveSessionId);
+
       const result = await AgentManager.processMessage(message, 'desktop', sessionId || 'default');
       updateTrayMenu();
 
@@ -1224,6 +1357,7 @@ function setupIPC(): void {
         suggestedPrompt: result.suggestedPrompt,
         wasCompacted: result.wasCompacted,
         media: result.media,
+        planPending: result.planPending,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -1265,8 +1399,11 @@ function setupIPC(): void {
   ipcMain.handle('sessions:create', async (_, name: string) => {
     try {
       // Use the current global mode as default for new sessions
+      // Don't create working directory yet — it's created lazily on first message
+      // so users can switch modes before committing
       const mode = AgentManager.getMode();
-      const session = memory?.createSession(name, mode);
+      console.log(`[Sessions] Creating session "${name}" mode=${mode} workingDirectory=null (deferred)`);
+      const session = memory?.createSession(name, mode, null);
       // Notify iOS of updated session list
       if (iosChannel) {
         iosChannel.broadcast({ type: 'sessions', sessions: memory?.getSessions() || [], activeSessionId: '' });
@@ -1279,7 +1416,24 @@ function setupIPC(): void {
 
   ipcMain.handle('sessions:rename', async (_, id: string, name: string) => {
     try {
-      const success = memory?.renameSession(id, name) ?? false;
+      // Check if session has a working directory that needs renaming
+      const session = memory?.getSession(id);
+      let newWorkingDirectory: string | undefined;
+      console.log(`[Sessions] Renaming session ${id} to "${name}" | current working_directory=${session?.working_directory || 'null'}`);
+
+      if (session?.working_directory) {
+        const newPath = renameSessionDirectory(session.working_directory, name);
+        if (!newPath) {
+          console.log(`[Sessions] Rename blocked: directory "${name}" already exists`);
+          return { success: false, error: `Cannot rename: directory "${name}" already exists` };
+        }
+        newWorkingDirectory = newPath;
+        console.log(`[Sessions] Directory renamed: ${session.working_directory} -> ${newPath} | closing SDK session`);
+        // Close persistent SDK session since cwd changed
+        AgentManager.clearSdkSessionMapping(id);
+      }
+
+      const success = memory?.renameSession(id, name, newWorkingDirectory) ?? false;
       // Notify iOS of updated session list
       if (success && iosChannel) {
         iosChannel.broadcast({ type: 'sessions', sessions: memory?.getSessions() || [], activeSessionId: '' });
@@ -1343,6 +1497,20 @@ function setupIPC(): void {
     if (msgCount > 0) {
       return { success: false, error: 'Cannot change mode after messages have been sent' };
     }
+
+    const session = memory?.getSession(sessionId);
+    console.log(`[Sessions] Mode switch: session=${sessionId} "${session?.name}" ${session?.mode}->${mode} | current working_directory=${session?.working_directory || 'null'}`);
+
+    // Don't create working directory on mode switch — it's created lazily on first message.
+    // When switching to general: clear working directory (keep directory on disk)
+    if (mode === 'general' && session?.working_directory) {
+      console.log(`[Sessions] Clearing working directory (kept on disk): ${session.working_directory}`);
+      memory?.setSessionWorkingDirectory(sessionId, null);
+    }
+
+    // Close persistent SDK session in both cases (cwd may have changed)
+    AgentManager.clearSdkSessionMapping(sessionId);
+
     const success = memory?.setSessionMode(sessionId, mode) ?? false;
     return { success };
   });
@@ -1403,6 +1571,7 @@ function setupIPC(): void {
               }
             };
             AgentManager.on('status', desktopStatusHandler);
+            ensureCoderWorkingDirectory(message.sessionId);
             let result;
             try {
               result = await AgentManager.processMessage(messageText, 'ios', message.sessionId);
@@ -1419,7 +1588,7 @@ function setupIPC(): void {
             if (telegramBot && linkedChatId) {
               telegramBot.syncToChat(messageText, result.response, linkedChatId, result.media).catch(() => {});
             }
-            return { response: result.response, tokensUsed: result.tokensUsed, media: result.media };
+            return { response: result.response, tokensUsed: result.tokensUsed, media: result.media, planPending: result.planPending };
           });
           iosChannel.setSessionsHandler(() => {
             const sessions = memory?.getSessions() || [];
@@ -1506,23 +1675,30 @@ function setupIPC(): void {
           iosChannel.setSoulDeleteHandler((id) => { memory?.deleteSoulAspectById(id); return true; });
           iosChannel.setFactsGraphHandler(async () => memory?.getFactsGraphData() || { nodes: [] as never[], links: [] as never[] });
           iosChannel.setCustomizeGetHandler(() => ({
-            identity: loadIdentity(), instructions: loadInstructions(),
+            agentName: SettingsManager.get('personalize.agentName') || 'Frankie',
+            personality: SettingsManager.get('personalize.personality') || '',
+            goals: SettingsManager.get('personalize.goals') || '',
+            struggles: SettingsManager.get('personalize.struggles') || '',
+            funFacts: SettingsManager.get('personalize.funFacts') || '',
+            systemGuidelines: SYSTEM_GUIDELINES,
             profile: {
               name: SettingsManager.get('profile.name') || '', occupation: SettingsManager.get('profile.occupation') || '',
               location: SettingsManager.get('profile.location') || '', timezone: SettingsManager.get('profile.timezone') || '',
-              birthday: SettingsManager.get('profile.birthday') || '', custom: SettingsManager.get('profile.custom') || '',
+              birthday: SettingsManager.get('profile.birthday') || '',
             },
           }));
-          iosChannel.setCustomizeSaveHandler((identity, instructions, profile) => {
-            if (identity !== undefined) saveIdentity(identity);
-            if (instructions !== undefined) saveInstructions(instructions);
-            if (profile) {
-              if (profile.name !== undefined) SettingsManager.set('profile.name', profile.name);
-              if (profile.occupation !== undefined) SettingsManager.set('profile.occupation', profile.occupation);
-              if (profile.location !== undefined) SettingsManager.set('profile.location', profile.location);
-              if (profile.timezone !== undefined) SettingsManager.set('profile.timezone', profile.timezone);
-              if (profile.birthday !== undefined) SettingsManager.set('profile.birthday', profile.birthday);
-              if (profile.custom !== undefined) SettingsManager.set('profile.custom', profile.custom);
+          iosChannel.setCustomizeSaveHandler((data) => {
+            if (data.agentName !== undefined) SettingsManager.set('personalize.agentName', data.agentName);
+            if (data.personality !== undefined) SettingsManager.set('personalize.personality', data.personality);
+            if (data.goals !== undefined) SettingsManager.set('personalize.goals', data.goals);
+            if (data.struggles !== undefined) SettingsManager.set('personalize.struggles', data.struggles);
+            if (data.funFacts !== undefined) SettingsManager.set('personalize.funFacts', data.funFacts);
+            if (data.profile) {
+              if (data.profile.name !== undefined) SettingsManager.set('profile.name', data.profile.name);
+              if (data.profile.occupation !== undefined) SettingsManager.set('profile.occupation', data.profile.occupation);
+              if (data.profile.location !== undefined) SettingsManager.set('profile.location', data.profile.location);
+              if (data.profile.timezone !== undefined) SettingsManager.set('profile.timezone', data.profile.timezone);
+              if (data.profile.birthday !== undefined) SettingsManager.set('profile.birthday', data.profile.birthday);
             }
           });
           iosChannel.setRoutinesListHandler(() => scheduler?.getAllJobs() || []);
@@ -1568,6 +1744,17 @@ function setupIPC(): void {
               chatWindow.webContents.send('agent:modeChanged', mode);
             }
             return { mode, locked: false };
+          });
+          iosChannel.setWorkflowsHandler((sessionId: string) => {
+            const sessionMode = memory?.getSessionMode(sessionId) || 'coder';
+            const sessionWorkDir = memory?.getSessionWorkingDirectory(sessionId);
+            if (sessionMode === 'coder' && sessionWorkDir) {
+              const sessionCommandsDir = path.join(sessionWorkDir, '.claude', 'commands');
+              if (fs.existsSync(sessionCommandsDir)) {
+                return loadWorkflowCommandsFromDir(sessionCommandsDir).map(c => ({ name: c.name, description: c.description, content: c.content }));
+              }
+            }
+            return loadWorkflowCommands().map(c => ({ name: c.name, description: c.description, content: c.content }));
           });
           // Calendar & Tasks handlers
           iosChannel.setCalendarListHandler(async () => {
@@ -1750,32 +1937,9 @@ function setupIPC(): void {
     }
   });
 
-  // Customize - Identity
-  ipcMain.handle('customize:getIdentity', async () => {
-    return loadIdentity();
-  });
-
-  ipcMain.handle('customize:saveIdentity', async (_, content: string) => {
-    const success = saveIdentity(content);
-    return { success };
-  });
-
-  ipcMain.handle('customize:getIdentityPath', async () => {
-    return getIdentityPath();
-  });
-
-  // Customize - Instructions
-  ipcMain.handle('customize:getInstructions', async () => {
-    return loadInstructions();
-  });
-
-  ipcMain.handle('customize:saveInstructions', async (_, content: string) => {
-    const success = saveInstructions(content);
-    return { success };
-  });
-
-  ipcMain.handle('customize:getInstructionsPath', async () => {
-    return getInstructionsPath();
+  // Customize - System prompt (read-only, developer-controlled content only)
+  ipcMain.handle('customize:getSystemPrompt', async () => {
+    return AgentManager.getDeveloperPrompt() || '';
   });
 
   // Location and timezone lookup
@@ -2151,7 +2315,19 @@ function setupIPC(): void {
   });
 
   // Commands (Workflows)
-  ipcMain.handle('commands:list', async () => {
+  ipcMain.handle('commands:list', async (_, sessionId?: string) => {
+    // For coder sessions with a working directory, load commands from the session's
+    // .claude/commands/ directory instead of the root workspace
+    if (sessionId && memory) {
+      const sessionMode = memory.getSessionMode(sessionId);
+      const sessionWorkDir = memory.getSessionWorkingDirectory(sessionId);
+      if (sessionMode === 'coder' && sessionWorkDir) {
+        const sessionCommandsDir = path.join(sessionWorkDir, '.claude', 'commands');
+        if (fs.existsSync(sessionCommandsDir)) {
+          return loadWorkflowCommandsFromDir(sessionCommandsDir);
+        }
+      }
+    }
     return loadWorkflowCommands();
   });
 
@@ -2374,6 +2550,7 @@ async function initializeAgent(): Promise<void> {
             }
           };
           AgentManager.on('status', desktopStatusHandler);
+          ensureCoderWorkingDirectory(message.sessionId);
           let result;
           try {
             result = await AgentManager.processMessage(
@@ -2407,6 +2584,7 @@ async function initializeAgent(): Promise<void> {
             response: result.response,
             tokensUsed: result.tokensUsed,
             media: result.media,
+            planPending: result.planPending,
           };
         });
 
@@ -2509,23 +2687,30 @@ async function initializeAgent(): Promise<void> {
         iosChannel.setSoulDeleteHandler((id) => { memory?.deleteSoulAspectById(id); return true; });
         iosChannel.setFactsGraphHandler(async () => memory?.getFactsGraphData() || { nodes: [] as never[], links: [] as never[] });
         iosChannel.setCustomizeGetHandler(() => ({
-          identity: loadIdentity(), instructions: loadInstructions(),
+          agentName: SettingsManager.get('personalize.agentName') || 'Frankie',
+          personality: SettingsManager.get('personalize.personality') || '',
+          goals: SettingsManager.get('personalize.goals') || '',
+          struggles: SettingsManager.get('personalize.struggles') || '',
+          funFacts: SettingsManager.get('personalize.funFacts') || '',
+          systemGuidelines: SYSTEM_GUIDELINES,
           profile: {
             name: SettingsManager.get('profile.name') || '', occupation: SettingsManager.get('profile.occupation') || '',
             location: SettingsManager.get('profile.location') || '', timezone: SettingsManager.get('profile.timezone') || '',
-            birthday: SettingsManager.get('profile.birthday') || '', custom: SettingsManager.get('profile.custom') || '',
+            birthday: SettingsManager.get('profile.birthday') || '',
           },
         }));
-        iosChannel.setCustomizeSaveHandler((identity, instructions, profile) => {
-          if (identity !== undefined) saveIdentity(identity);
-          if (instructions !== undefined) saveInstructions(instructions);
-          if (profile) {
-            if (profile.name !== undefined) SettingsManager.set('profile.name', profile.name);
-            if (profile.occupation !== undefined) SettingsManager.set('profile.occupation', profile.occupation);
-            if (profile.location !== undefined) SettingsManager.set('profile.location', profile.location);
-            if (profile.timezone !== undefined) SettingsManager.set('profile.timezone', profile.timezone);
-            if (profile.birthday !== undefined) SettingsManager.set('profile.birthday', profile.birthday);
-            if (profile.custom !== undefined) SettingsManager.set('profile.custom', profile.custom);
+        iosChannel.setCustomizeSaveHandler((data) => {
+          if (data.agentName !== undefined) SettingsManager.set('personalize.agentName', data.agentName);
+          if (data.personality !== undefined) SettingsManager.set('personalize.personality', data.personality);
+          if (data.goals !== undefined) SettingsManager.set('personalize.goals', data.goals);
+          if (data.struggles !== undefined) SettingsManager.set('personalize.struggles', data.struggles);
+          if (data.funFacts !== undefined) SettingsManager.set('personalize.funFacts', data.funFacts);
+          if (data.profile) {
+            if (data.profile.name !== undefined) SettingsManager.set('profile.name', data.profile.name);
+            if (data.profile.occupation !== undefined) SettingsManager.set('profile.occupation', data.profile.occupation);
+            if (data.profile.location !== undefined) SettingsManager.set('profile.location', data.profile.location);
+            if (data.profile.timezone !== undefined) SettingsManager.set('profile.timezone', data.profile.timezone);
+            if (data.profile.birthday !== undefined) SettingsManager.set('profile.birthday', data.profile.birthday);
           }
         });
         iosChannel.setRoutinesListHandler(() => scheduler?.getAllJobs() || []);
@@ -2570,6 +2755,17 @@ async function initializeAgent(): Promise<void> {
             chatWindow.webContents.send('agent:modeChanged', mode);
           }
           return { mode, locked: false };
+        });
+        iosChannel.setWorkflowsHandler((sessionId: string) => {
+          const sessionMode = memory?.getSessionMode(sessionId) || 'coder';
+          const sessionWorkDir = memory?.getSessionWorkingDirectory(sessionId);
+          if (sessionMode === 'coder' && sessionWorkDir) {
+            const sessionCommandsDir = path.join(sessionWorkDir, '.claude', 'commands');
+            if (fs.existsSync(sessionCommandsDir)) {
+              return loadWorkflowCommandsFromDir(sessionCommandsDir).map(c => ({ name: c.name, description: c.description, content: c.content }));
+            }
+          }
+          return loadWorkflowCommands().map(c => ({ name: c.name, description: c.description, content: c.content }));
         });
         // Calendar & Tasks handlers
         iosChannel.setCalendarListHandler(async () => {
@@ -2843,6 +3039,12 @@ app.whenReady().then(async () => {
       getBrowserManager().forceReconnectCdp().catch((err) => {
         console.warn('[Power] CDP reconnect after resume failed:', err);
       });
+      // Force iOS relay reconnection — WebSocket is dead after sleep
+      if (iosChannel) {
+        iosChannel.forceReconnect().catch((err) => {
+          console.warn('[Power] iOS relay reconnect after resume failed:', err);
+        });
+      }
     });
 
     // Handle lock screen (display off but CPU running)
@@ -2857,6 +3059,12 @@ app.whenReady().then(async () => {
       getBrowserManager().forceReconnectCdp().catch((err) => {
         console.warn('[Power] CDP reconnect after unlock failed:', err);
       });
+      // Force iOS relay reconnection — connection may have gone stale during lock
+      if (iosChannel) {
+        iosChannel.forceReconnect().catch((err) => {
+          console.warn('[Power] iOS relay reconnect after unlock failed:', err);
+        });
+      }
     });
 
     // Clean up on app quit
@@ -2884,6 +3092,9 @@ app.whenReady().then(async () => {
     const oldConfigPath = path.join(userDataPath, 'config.json');
     await SettingsManager.migrateFromConfig(oldConfigPath);
     console.log('[Main] Settings initialized');
+
+    // Migrate identity.md → personalize settings (one-time)
+    migratePersonalizeFromIdentity();
 
     // Initialize memory (shared with settings)
     console.log('[Main] Initializing memory...');

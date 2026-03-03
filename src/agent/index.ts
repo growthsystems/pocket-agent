@@ -1,8 +1,7 @@
 import { MemoryManager, Message, DailyLog } from '../memory';
 import { buildMCPServers, buildSdkMcpServers, setMemoryManager, setSoulMemoryManager, ToolsConfig, validateToolsConfig, getCurrentSessionId } from '../tools';
 import { closeBrowserManager } from '../browser';
-import { loadIdentity } from '../config/identity';
-import { loadInstructions } from '../config/instructions';
+import { SYSTEM_GUIDELINES } from '../config/system-guidelines';
 import { SettingsManager } from '../settings';
 import { EventEmitter } from 'events';
 import fs from 'fs';
@@ -164,7 +163,7 @@ function formatAgentError(error: string): string {
 
 // Status event types
 export type AgentStatus = {
-  type: 'thinking' | 'tool_start' | 'tool_end' | 'tool_blocked' | 'responding' | 'done' | 'subagent_start' | 'subagent_update' | 'subagent_end' | 'queued' | 'queue_processing' | 'teammate_start' | 'teammate_idle' | 'teammate_message' | 'task_completed' | 'background_task_start' | 'background_task_output' | 'background_task_end' | 'partial_text';
+  type: 'thinking' | 'tool_start' | 'tool_end' | 'tool_blocked' | 'responding' | 'done' | 'subagent_start' | 'subagent_update' | 'subagent_end' | 'queued' | 'queue_processing' | 'teammate_start' | 'teammate_idle' | 'teammate_message' | 'task_completed' | 'background_task_start' | 'background_task_output' | 'background_task_end' | 'partial_text' | 'plan_mode_entered' | 'plan_mode_exited';
   sessionId?: string;
   toolName?: string;
   toolInput?: string;
@@ -245,6 +244,8 @@ type SDKOptions = {
   mcpServers?: Record<string, unknown>;
   settingSources?: ('project' | 'user')[];
   canUseTool?: CanUseToolCallback;  // Pre-tool-use validation callback
+  permissionMode?: string;
+  allowDangerouslySkipPermissions?: boolean;
   env?: { [envVar: string]: string | undefined };  // Environment variables for Claude Code process
   hooks?: {
     PreToolUse?: Array<{ hooks: PreToolUseHookCallback[] }>;
@@ -331,6 +332,7 @@ export interface ProcessResult {
   contextTokens?: number;
   contextWindow?: number;
   media?: MediaAttachment[];
+  planPending?: boolean;
 }
 
 /**
@@ -346,8 +348,6 @@ class AgentManagerClass extends EventEmitter {
   private chatEngine: ChatEngine | null = null;
   private toolsConfig: ToolsConfig | null = null;
   private initialized: boolean = false;
-  private identity: string = '';
-  private instructions: string = '';
   private abortControllersBySession: Map<string, AbortController> = new Map();
   private processingBySession: Map<string, boolean> = new Map();
   private lastSuggestedPromptBySession: Map<string, string | undefined> = new Map();
@@ -358,6 +358,7 @@ class AgentManagerClass extends EventEmitter {
   private pendingMedia: MediaAttachment[] = [];
   private stoppedByUserSession: Set<string> = new Set();
   private sdkToolTimers: Map<string, { timer: ReturnType<typeof setTimeout>; sessionId: string }> = new Map();
+  private pendingProjectSwitch: Set<string> = new Set();
 
   // Per-tool timeouts for SDK built-in tools (MCP tools have their own via wrapToolHandler)
   private static readonly SDK_TOOL_TIMEOUTS: Record<string, number> = {
@@ -397,8 +398,6 @@ class AgentManagerClass extends EventEmitter {
       process.env.CLAUDE_CONFIG_DIR = path.join(config.dataDir, '.claude');
     }
 
-    this.identity = loadIdentity();
-    this.instructions = loadInstructions();
     setMemoryManager(this.memory);
     setSoulMemoryManager(this.memory);
 
@@ -411,8 +410,6 @@ class AgentManagerClass extends EventEmitter {
     console.log('[AgentManager] Project root:', this.projectRoot);
     console.log('[AgentManager] Workspace:', this.workspace);
     console.log('[AgentManager] Model:', this.model);
-    console.log('[AgentManager] Identity loaded:', this.identity.length, 'chars');
-    console.log('[AgentManager] Instructions loaded:', this.instructions.length, 'chars');
 
     if (this.toolsConfig) {
       const validation = validateToolsConfig(this.toolsConfig);
@@ -516,7 +513,15 @@ class AgentManagerClass extends EventEmitter {
     // Route by per-session mode (not global mode)
     const sessionMode = this.memory.getSessionMode(sessionId);
     if (sessionMode === 'general' && this.chatEngine) {
-      return this.chatEngine.processMessage(userMessage, channel, sessionId, images, attachmentInfo);
+      const result = await this.chatEngine.processMessage(userMessage, channel, sessionId, images, attachmentInfo);
+      // Store context usage for stats display
+      if (result.contextTokens !== undefined || result.contextWindow !== undefined) {
+        this.contextUsageBySession.set(sessionId, {
+          contextTokens: result.contextTokens ?? 0,
+          contextWindow: result.contextWindow ?? 0,
+        });
+      }
+      return result;
     }
 
     // If already processing, queue the message
@@ -672,23 +677,7 @@ class AgentManagerClass extends EventEmitter {
           (msg, current) => this.extractFromMessage(msg, current)
         );
 
-        // Listen for SDK session ID capture
-        session.on('sdkSessionId', (capturedId: string) => {
-          this.sdkSessionIdBySession.set(sessionId, capturedId);
-          memory.setSdkSessionId(sessionId, capturedId);
-        });
-
-        // Listen for session closure
-        session.on('closed', () => {
-          console.log(`[AgentManager] Persistent session closed: ${sessionId}`);
-          // Clear SDK tool timeout timers belonging to this session
-          for (const [id, entry] of this.sdkToolTimers.entries()) {
-            if (entry.sessionId === sessionId) {
-              clearTimeout(entry.timer);
-              this.sdkToolTimers.delete(id);
-            }
-          }
-        });
+        this.setupSessionListeners(session, sessionId, memory);
 
         this.persistentSessions.set(sessionId, session);
 
@@ -740,21 +729,7 @@ class AgentManagerClass extends EventEmitter {
               (msg, current) => this.extractFromMessage(msg, current)
             );
 
-            freshSession.on('sdkSessionId', (capturedId: string) => {
-              this.sdkSessionIdBySession.set(sessionId, capturedId);
-              memory.setSdkSessionId(sessionId, capturedId);
-            });
-
-            freshSession.on('closed', () => {
-              console.log(`[AgentManager] Persistent session closed: ${sessionId}`);
-              // Clear SDK tool timeout timers belonging to this session
-              for (const [id, entry] of this.sdkToolTimers.entries()) {
-                if (entry.sessionId === sessionId) {
-                  clearTimeout(entry.timer);
-                  this.sdkToolTimers.delete(id);
-                }
-              }
-            });
+            this.setupSessionListeners(freshSession, sessionId, memory);
 
             this.persistentSessions.set(sessionId, freshSession);
 
@@ -824,21 +799,7 @@ class AgentManagerClass extends EventEmitter {
           (msg, current) => this.extractFromMessage(msg, current)
         );
 
-        freshSession.on('sdkSessionId', (capturedId: string) => {
-          this.sdkSessionIdBySession.set(sessionId, capturedId);
-          memory.setSdkSessionId(sessionId, capturedId);
-        });
-
-        freshSession.on('closed', () => {
-          console.log(`[AgentManager] Persistent session closed: ${sessionId}`);
-          // Clear SDK tool timeout timers belonging to this session
-          for (const [id, entry] of this.sdkToolTimers.entries()) {
-            if (entry.sessionId === sessionId) {
-              clearTimeout(entry.timer);
-              this.sdkToolTimers.delete(id);
-            }
-          }
-        });
+        this.setupSessionListeners(freshSession, sessionId, memory);
 
         this.persistentSessions.set(sessionId, freshSession);
         this.emitStatus({ type: 'thinking', sessionId, message: 'reconnecting...' });
@@ -882,6 +843,48 @@ class AgentManagerClass extends EventEmitter {
           tokensUsed: 0,
           wasCompacted: false,
           suggestedPrompt: partialResponse ? this.lastSuggestedPromptBySession.get(sessionId) : undefined,
+        };
+      }
+
+      // Plan mode interception: if the agent exited plan mode, return early
+      // so the UI shows approval overlay instead of normal response flow
+      if (turnResult.exitedPlanMode && !wasAborted) {
+        // Prefer the plan file content over the agent's conversational response,
+        // which may include error commentary about ExitPlanMode retries
+        let planContent = turnResult.response || '';
+        if (turnResult.planFilePath) {
+          try {
+            planContent = fs.readFileSync(turnResult.planFilePath, 'utf-8');
+            console.log(`[AgentManager] Read plan from file: ${turnResult.planFilePath} (${planContent.length} chars)`);
+          } catch (err) {
+            console.warn(`[AgentManager] Could not read plan file ${turnResult.planFilePath}:`, err);
+            // Fall back to turnResult.response
+          }
+        }
+
+        // Save messages to memory
+        const isScheduledJob = channel.startsWith('cron:');
+        if (!isScheduledJob && planContent) {
+          memory.saveMessage('user', userMessage, sessionId);
+          memory.saveMessage('assistant', planContent, sessionId);
+        }
+
+        this.emitStatus({ type: 'done', sessionId });
+        this.processingBySession.set(sessionId, false);
+
+        // Process next message in queue
+        setTimeout(() => {
+          this.processQueue(sessionId).catch((err) => {
+            console.error('[AgentManager] Queue processing failed:', err);
+          });
+        }, 0);
+
+        return {
+          response: planContent,
+          tokensUsed: 0,
+          wasCompacted: turnResult.wasCompacted,
+          planPending: true,
+          media: this.pendingMedia.length > 0 ? this.pendingMedia : undefined,
         };
       }
 
@@ -991,6 +994,20 @@ class AgentManagerClass extends EventEmitter {
       }
 
       this.extractAndStoreFacts(userMessage);
+
+      // If set_project was called during this turn, close the persistent session
+      // so the next message creates a new one with the updated cwd.
+      if (this.pendingProjectSwitch.has(sessionId)) {
+        this.pendingProjectSwitch.delete(sessionId);
+        const switchedSession = this.persistentSessions.get(sessionId);
+        if (switchedSession) {
+          console.log(`[AgentManager] Closing session ${sessionId} after project switch — new cwd takes effect next message`);
+          switchedSession.close();
+          this.persistentSessions.delete(sessionId);
+          this.sdkSessionIdBySession.delete(sessionId);
+          memory.clearSdkSessionId(sessionId);
+        }
+      }
 
       const statsAfter = memory.getStats();
       const contextUsage = this.contextUsageBySession.get(sessionId);
@@ -1179,6 +1196,16 @@ class AgentManagerClass extends EventEmitter {
   }
 
   /**
+   * Flag that a project switch occurred for a session.
+   * After the current turn completes, the persistent session will be closed
+   * so the next message picks up the new cwd.
+   */
+  flagProjectSwitch(sessionId: string): void {
+    this.pendingProjectSwitch.add(sessionId);
+    console.log(`[AgentManager] Project switch flagged for session ${sessionId}`);
+  }
+
+  /**
    * Set the workspace directory for agent file operations.
    * This takes effect on the next SDK query (cwd option).
    * Closes all persistent sessions and clears SDK session mappings since sessions are tied to cwd.
@@ -1210,6 +1237,42 @@ class AgentManagerClass extends EventEmitter {
     this.closePersistentSession(sessionId);
     this.sdkSessionIdBySession.delete(sessionId);
     console.log(`[AgentManager] Cleared SDK session mapping for ${sessionId}`);
+  }
+
+  /**
+   * Set up event listeners shared across all persistent session creation sites.
+   */
+  private setupSessionListeners(session: PersistentSDKSession, sessionId: string, memory: MemoryManager): void {
+    session.on('sdkSessionId', (capturedId: string) => {
+      this.sdkSessionIdBySession.set(sessionId, capturedId);
+      memory.setSdkSessionId(sessionId, capturedId);
+    });
+
+    session.on('closed', () => {
+      console.log(`[AgentManager] Persistent session closed: ${sessionId}`);
+      for (const [id, entry] of this.sdkToolTimers.entries()) {
+        if (entry.sessionId === sessionId) {
+          clearTimeout(entry.timer);
+          this.sdkToolTimers.delete(id);
+        }
+      }
+    });
+
+    session.on('planModeEntered', () => {
+      this.emitStatus({
+        type: 'plan_mode_entered',
+        sessionId,
+        message: 'planning the pounce...',
+      });
+    });
+
+    session.on('planModeExited', () => {
+      this.emitStatus({
+        type: 'plan_mode_exited',
+        sessionId,
+        message: 'plan ready for review',
+      });
+    });
   }
 
   /**
@@ -1245,26 +1308,50 @@ class AgentManagerClass extends EventEmitter {
    * the UserPromptSubmit hook's additionalContext, so it's fresh for each turn.
    */
   private async buildPersistentOptions(memory: MemoryManager, sessionId: string, sdkSessionId?: string): Promise<SDKOptions> {
+    // Determine session mode — coder mode gets lean context (SDK preset + CLAUDE.md only)
+    const sessionMode = memory.getSessionMode(sessionId);
+    const isCoder = sessionMode === 'coder';
+
     // === Static context (set once at session creation) ===
     // NOTE: CLAUDE.md (this.instructions) is NOT included here because the SDK
     // already reads it from the workspace via cwd + settingSources: ['project'].
     // Including it here would inject it twice.
     const staticParts: string[] = [];
 
-    if (this.identity) {
-      staticParts.push(this.identity);
+    // Personalize, guidelines, and profile are only needed for general (personal assistant) mode
+    if (isCoder) {
+      console.log(`[AgentManager] Coder mode — skipping identity, user context, guidelines, capabilities (SDK uses workspace CLAUDE.md)`);
+    }
+    if (!isCoder) {
+      // 1. Agent Identity: name, description, personality
+      const identity = SettingsManager.getFormattedIdentity();
+      if (identity) {
+        staticParts.push(identity);
+        console.log(`[AgentManager] Identity injected: ${identity.length} chars`);
+      }
+
+      // 2. User Context: profile + world
+      const userContext = SettingsManager.getFormattedUserContext();
+      if (userContext) {
+        staticParts.push(userContext);
+        console.log(`[AgentManager] User context injected: ${userContext.length} chars`);
+      }
+
+      // 3. System Guidelines: developer-controlled instructions
+      staticParts.push(SYSTEM_GUIDELINES);
+      console.log(`[AgentManager] System guidelines injected: ${SYSTEM_GUIDELINES.length} chars`);
     }
 
-    // Add user profile from settings
-    const userProfile = SettingsManager.getFormattedProfile();
-    if (userProfile) {
-      staticParts.push(userProfile);
-    }
+    // Look up per-session working directory (falls back to global workspace)
+    const sessionWorkingDir = memory.getSessionWorkingDirectory(sessionId);
+    const effectiveCwd = sessionWorkingDir || this.workspace;
+    console.log(`[AgentManager] buildPersistentOptions session=${sessionId} mode=${sessionMode} | sessionWorkingDir=${sessionWorkingDir || 'null'} | effectiveCwd=${effectiveCwd}`);
 
-    // Add capabilities information
-    const capabilities = this.buildCapabilitiesPrompt();
-    if (capabilities) {
-      staticParts.push(capabilities);
+    // Log prompt summary for the mode
+    if (isCoder) {
+      console.log(`[AgentManager] Coder mode prompt — static: ${staticParts.join('').length} chars (SDK reads CLAUDE.md from workspace cwd)`);
+    } else {
+      console.log(`[AgentManager] General mode prompt — static: ${staticParts.join('\n\n').length} chars`);
     }
 
     // Get thinking level config — only Anthropic models support thinking/effort.
@@ -1286,19 +1373,31 @@ class AgentManagerClass extends EventEmitter {
 
     const options: SDKOptions = {
       model: this.model,
-      cwd: this.workspace,
+      cwd: effectiveCwd,
       maxTurns: 100,
       ...(isAnthropicModel && { thinking: thinkingEntry.thinking }),
       ...(isAnthropicModel && thinkingEntry.effort && { effort: thinkingEntry.effort }),
       tools: { type: 'preset', preset: 'claude_code' },
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
       settingSources: ['project'],
       canUseTool: buildCanUseToolCallback(),
       env,
       hooks: {
         PreToolUse: [buildPreToolUseHook()],
         // Dynamic context injection: fresh facts/soul/temporal for each message
+        // Coder mode skips all personal assistant context for lean coding sessions
         UserPromptSubmit: [{
           hooks: [async () => {
+            if (isCoder) {
+              return {
+                hookSpecificOutput: {
+                  hookEventName: 'UserPromptSubmit' as const,
+                  additionalContext: '',
+                },
+              };
+            }
+
             const dynamicParts: string[] = [];
 
             // Temporal context (current time)
@@ -1361,6 +1460,8 @@ class AgentManagerClass extends EventEmitter {
       allowedTools: [
         // Built-in SDK tools
         'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+        // Plan mode tools
+        'EnterPlanMode', 'ExitPlanMode', 'AskUserQuestion',
         // Agent Teams tools
         'TeammateTool', 'TeamCreate', 'SendMessage', 'TaskCreate', 'TaskGet', 'TaskUpdate', 'TaskList',
         // Background task tools (persist across turns with persistent sessions)
@@ -1368,37 +1469,44 @@ class AgentManagerClass extends EventEmitter {
         // Custom MCP tools - browser & system
         'mcp__pocket-agent__browser',
         'mcp__pocket-agent__notify',
-        // Custom MCP tools - memory
-        'mcp__pocket-agent__remember',
-        'mcp__pocket-agent__forget',
-        'mcp__pocket-agent__list_facts',
-        'mcp__pocket-agent__memory_search',
-        'mcp__pocket-agent__daily_log',
-        // Custom MCP tools - soul
-        'mcp__pocket-agent__soul_set',
-        'mcp__pocket-agent__soul_get',
-        'mcp__pocket-agent__soul_list',
-        'mcp__pocket-agent__soul_delete',
-        // Custom MCP tools - scheduler
-        'mcp__pocket-agent__schedule_task',
-        'mcp__pocket-agent__create_reminder',
-        'mcp__pocket-agent__list_scheduled_tasks',
-        'mcp__pocket-agent__delete_scheduled_task',
-        // Custom MCP tools - calendar
-        'mcp__pocket-agent__calendar_add',
-        'mcp__pocket-agent__calendar_list',
-        'mcp__pocket-agent__calendar_upcoming',
-        'mcp__pocket-agent__calendar_delete',
-        // Custom MCP tools - tasks
-        'mcp__pocket-agent__task_add',
-        'mcp__pocket-agent__task_list',
-        'mcp__pocket-agent__task_complete',
-        'mcp__pocket-agent__task_delete',
-        'mcp__pocket-agent__task_due',
         // Custom MCP tools - project
         'mcp__pocket-agent__set_project',
         'mcp__pocket-agent__get_project',
         'mcp__pocket-agent__clear_project',
+        // Coder-only tools
+        ...(isCoder ? [
+          'mcp__grep__searchGitHub',
+        ] : []),
+        // Personal assistant tools — only in general mode
+        ...(isCoder ? [] : [
+          // Memory
+          'mcp__pocket-agent__remember',
+          'mcp__pocket-agent__forget',
+          'mcp__pocket-agent__list_facts',
+          'mcp__pocket-agent__memory_search',
+          'mcp__pocket-agent__daily_log',
+          // Soul
+          'mcp__pocket-agent__soul_set',
+          'mcp__pocket-agent__soul_get',
+          'mcp__pocket-agent__soul_list',
+          'mcp__pocket-agent__soul_delete',
+          // Scheduler
+          'mcp__pocket-agent__schedule_task',
+          'mcp__pocket-agent__create_reminder',
+          'mcp__pocket-agent__list_scheduled_tasks',
+          'mcp__pocket-agent__delete_scheduled_task',
+          // Calendar
+          'mcp__pocket-agent__calendar_add',
+          'mcp__pocket-agent__calendar_list',
+          'mcp__pocket-agent__calendar_upcoming',
+          'mcp__pocket-agent__calendar_delete',
+          // Tasks
+          'mcp__pocket-agent__task_add',
+          'mcp__pocket-agent__task_list',
+          'mcp__pocket-agent__task_complete',
+          'mcp__pocket-agent__task_delete',
+          'mcp__pocket-agent__task_due',
+        ]),
       ],
       persistSession: true,
       ...(sdkSessionId && { resume: sdkSessionId }),
@@ -1417,12 +1525,15 @@ class AgentManagerClass extends EventEmitter {
       const mcpServers = buildMCPServers(this.toolsConfig);
 
       // Build SDK MCP servers (in-process tools like browser, notify, memory)
-      const sdkMcpServers = await buildSdkMcpServers(this.toolsConfig);
+      // Coder mode only registers coding-relevant tools (browser, notify, project)
+      const sdkMcpServers = await buildSdkMcpServers(this.toolsConfig, sessionMode);
 
-      // Merge both types
-      const allServers = {
+      // Merge both types + remote MCP servers (coder only)
+      const allServers: Record<string, unknown> = {
         ...mcpServers,
         ...(sdkMcpServers || {}),
+        // Grep MCP — remote code search across 1M+ public GitHub repos (coder only)
+        ...(isCoder ? { grep: { type: 'http', url: 'https://mcp.grep.app' } } : {}),
       };
 
       if (Object.keys(allServers).length > 0) {
@@ -1434,123 +1545,6 @@ class AgentManagerClass extends EventEmitter {
     return options;
   }
 
-  private buildCapabilitiesPrompt(): string {
-    return `## Your Capabilities as Pocket Agent
-
-You are a persistent personal AI assistant with special capabilities.
-
-### Your Workspace
-Your working directory is: ${this.workspace}
-This is an isolated environment separate from the application code.
-All file operations (reading, writing, creating projects) happen here by default.
-Feel free to create subdirectories, projects, and files as needed.
-
-### Scheduling & Reminders
-Use the schedule_task tool to create reminders. Three schedule formats are supported:
-
-- One-time: "in 10 minutes", "in 2 hours", "tomorrow 3pm", "monday 9am"
-- Interval: "30m", "2h", "1d" (runs every X)
-- Cron: "0 9 * * *" (minute hour day month weekday)
-
-Examples:
-- schedule_task(name="call_mom", schedule="in 2 hours", prompt="Time to call mom!")
-- schedule_task(name="water", schedule="2h", prompt="Time to drink water!")
-- schedule_task(name="standup", schedule="0 9 * * 1-5", prompt="Daily standup time")
-
-Use list_scheduled_tasks to see all scheduled tasks.
-Use delete_scheduled_task to remove a task.
-
-RULES:
-- Use short, clean names (water, standup, break) - NO timestamps
-- One-time jobs auto-delete after running
-
-### Calendar Events
-Use calendar tools to manage events with reminders:
-
-- calendar_add: Create an event with optional reminder
-- calendar_list: List events for a date
-- calendar_upcoming: Show upcoming events
-- calendar_delete: Remove an event
-
-Time formats: "today 3pm", "tomorrow 9am", "monday 2pm", "in 2 hours", ISO format
-Reminders trigger automatically before the event starts.
-
-### Tasks / Todos
-Use task tools to manage tasks with due dates and priorities:
-
-- task_add: Create a task with optional due date, priority (low/medium/high), reminder
-- task_list: List tasks by status (pending/completed/all)
-- task_complete: Mark a task as done
-- task_delete: Remove a task
-- task_due: Show tasks due soon
-
-Priorities: low, medium, high
-Status: pending, in_progress, completed
-
-### Memory & Facts
-You have persistent memory! PROACTIVELY save important info when the user shares it.
-
-Use memory tools:
-- remember: Save a fact (category, key, value)
-- forget: Delete a fact
-- list_facts: List all facts or by category
-- memory_search: Search facts by keyword
-
-Categories: user_info, preferences, projects, people, work, notes, decisions
-
-IMPORTANT: Save facts PROACTIVELY when user mentions:
-- Personal info (name, birthday, location)
-- Preferences (favorite things, likes/dislikes)
-- Projects they're working on
-- People important to them
-- Work/job details
-
-### Browser Automation
-You have a browser tool for JS rendering and authenticated sessions:
-
-\`\`\`
-Actions:
-- navigate: Go to URL
-- screenshot: Capture page image
-- click: Click an element
-- type: Enter text in input
-- evaluate: Run JavaScript
-- extract: Get page data (text/html/links/tables/structured)
-- scroll: Scroll page or element (up/down/left/right)
-- hover: Hover over element (triggers dropdowns)
-- download: Download a file
-- upload: Upload file to input
-- tabs_list: List open tabs (CDP tier only)
-- tabs_open: Open new tab (CDP tier only)
-- tabs_close: Close a tab (CDP tier only)
-- tabs_focus: Switch to tab (CDP tier only)
-
-Tiers:
-- Electron (default): Hidden window for JS rendering
-- CDP: Connects to user's Chrome for logged-in sessions + multi-tab
-
-Set requires_auth=true for pages needing login.
-For CDP, user must start Chrome with: --remote-debugging-port=9222
-\`\`\`
-
-### Image Display
-When you take screenshots or generate images, the image will be automatically displayed
-in the chat (both desktop and Telegram). You can reference screenshots in your responses
-and the user will see them inline.
-
-### Native Notifications
-You can send native desktop notifications:
-
-\`\`\`bash
-# Use the notify tool to alert the user
-notify(title="Task Complete", body="Your download has finished")
-notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
-\`\`\`
-
-### Limitations
-- Cannot send SMS or make calls
-- For full desktop automation, user needs to enable Computer Use (Docker-based)`;
-  }
 
   private extractFromMessage(message: unknown, current: string): string {
     const msg = message as { type?: string; subtype?: string; message?: { content?: unknown }; output?: string; result?: string; errors?: string[] };
@@ -1901,6 +1895,18 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
                 toolName,
                 toolInput: input.message?.slice(0, 80) || '',
                 message: input.type === 'broadcast' ? 'broadcasting to the squad' : `messaging ${input.to || 'teammate'}`,
+              });
+            } else if (rawName === 'EnterPlanMode') {
+              this.emitStatus({
+                type: 'plan_mode_entered',
+                sessionId,
+                message: 'planning the pounce...',
+              });
+            } else if (rawName === 'ExitPlanMode') {
+              this.emitStatus({
+                type: 'plan_mode_exited',
+                sessionId,
+                message: 'plan ready for review',
               });
             } else if (rawName === 'Bash' && this.isPocketCliCommand(block.input)) {
               const pocketName = this.formatPocketCommand(block.input);
@@ -2316,6 +2322,23 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
 
   saveFact(category: string, subject: string, content: string): void {
     this.memory?.saveFact(category, subject, content);
+  }
+
+  /**
+   * Get the assembled General mode system prompt for display in the UI.
+   */
+  getSystemPrompt(): { staticPrompt: string; dynamicPrompt: string } | null {
+    if (!this.chatEngine) return null;
+    return this.chatEngine.buildSystemPrompt();
+  }
+
+  /**
+   * Get only developer-controlled prompt sections (Ken's Settings + Capabilities).
+   * Excludes user-editable content and dynamic injections.
+   */
+  getDeveloperPrompt(): string | null {
+    if (!this.chatEngine) return null;
+    return this.chatEngine.getDeveloperPrompt();
   }
 
   getAllFacts(): Array<{ id: number; category: string; subject: string; content: string }> {

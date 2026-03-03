@@ -44,6 +44,7 @@ import {
   iOSAppInfoHandler,
   iOSModeGetHandler,
   iOSModeSwitchHandler,
+  iOSWorkflowsHandler,
   iOSCalendarListHandler, iOSCalendarAddHandler, iOSCalendarDeleteHandler, iOSCalendarUpcomingHandler,
   iOSTasksListHandler, iOSTasksAddHandler, iOSTasksCompleteHandler, iOSTasksDeleteHandler, iOSTasksDueHandler,
   iOSChatInfoHandler,
@@ -110,6 +111,7 @@ export class iOSRelayClient {
   private onSkinSet: ((skinId: string) => void) | null = null;
   private onGetMode: iOSModeGetHandler | null = null;
   private onSwitchMode: iOSModeSwitchHandler | null = null;
+  private onGetWorkflows: iOSWorkflowsHandler | null = null;
   private onCalendarList: iOSCalendarListHandler | null = null;
   private onCalendarAdd: iOSCalendarAddHandler | null = null;
   private onCalendarDelete: iOSCalendarDeleteHandler | null = null;
@@ -204,6 +206,7 @@ export class iOSRelayClient {
   setSkinHandler(handler: (skinId: string) => void): void { this.onSkinSet = handler; }
   setModeGetHandler(handler: iOSModeGetHandler): void { this.onGetMode = handler; }
   setModeSwitchHandler(handler: iOSModeSwitchHandler): void { this.onSwitchMode = handler; }
+  setWorkflowsHandler(handler: iOSWorkflowsHandler): void { this.onGetWorkflows = handler; }
   setCalendarListHandler(handler: iOSCalendarListHandler): void { this.onCalendarList = handler; }
   setCalendarAddHandler(handler: iOSCalendarAddHandler): void { this.onCalendarAdd = handler; }
   setCalendarDeleteHandler(handler: iOSCalendarDeleteHandler): void { this.onCalendarDelete = handler; }
@@ -335,6 +338,32 @@ export class iOSRelayClient {
 
   get isRunning(): boolean {
     return this._isRunning;
+  }
+
+  /** Force reconnect — used after system sleep/wake to recover stale WebSocket */
+  async forceReconnect(): Promise<void> {
+    if (!this._isRunning) return;
+    console.log('[iOS Relay] Force reconnecting (sleep/wake recovery)');
+
+    // Clear any pending reconnect timer
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Close stale WebSocket without triggering scheduleReconnect
+    const prevShouldReconnect = this.shouldReconnect;
+    this.shouldReconnect = false;
+    if (this.ws) {
+      this.stopPing();
+      this.ws.close();
+      this.ws = null;
+    }
+    this.shouldReconnect = prevShouldReconnect;
+
+    // Reset backoff and reconnect immediately
+    this.reconnectAttempts = 0;
+    await this.connect();
   }
 
   private connect(): Promise<void> {
@@ -692,16 +721,20 @@ export class iOSRelayClient {
         break;
       }
       case 'customize:get': {
-        const customize = this.onGetCustomize?.() || { identity: '', instructions: '' };
+        const customize = this.onGetCustomize?.() || { agentName: 'Frankie', personality: '', goals: '', struggles: '', funFacts: '', systemGuidelines: '' };
         this.sendToRelay(client.relayClientId, { type: 'customize', ...customize });
         break;
       }
       case 'customize:save': {
-        const identity = 'identity' in message ? (message as { identity: string }).identity : undefined;
-        const instructions = 'instructions' in message ? (message as { instructions: string }).instructions : undefined;
-        const profile = 'profile' in message ? (message as { profile: { name?: string; occupation?: string; location?: string; timezone?: string; birthday?: string; custom?: string } }).profile : undefined;
-        this.onSaveCustomize?.(identity, instructions, profile);
-        const updated = this.onGetCustomize?.() || { identity: '', instructions: '' };
+        const saveData: Record<string, unknown> = {};
+        if ('agentName' in message) saveData.agentName = (message as { agentName: string }).agentName;
+        if ('personality' in message) saveData.personality = (message as { personality: string }).personality;
+        if ('goals' in message) saveData.goals = (message as { goals: string }).goals;
+        if ('struggles' in message) saveData.struggles = (message as { struggles: string }).struggles;
+        if ('funFacts' in message) saveData.funFacts = (message as { funFacts: string }).funFacts;
+        if ('profile' in message) saveData.profile = (message as { profile: Record<string, string> }).profile;
+        this.onSaveCustomize?.(saveData as Parameters<NonNullable<typeof this.onSaveCustomize>>[0]);
+        const updated = this.onGetCustomize?.() || { agentName: 'Frankie', personality: '', goals: '', struggles: '', funFacts: '', systemGuidelines: '' };
         this.sendToRelay(client.relayClientId, { type: 'customize', ...updated });
         break;
       }
@@ -868,16 +901,17 @@ export class iOSRelayClient {
       }
       case 'chat:info': {
         const info = this.onChatInfo?.() || { username: '', adminKey: '' };
-        // Never send adminKey to clients
-        this.sendToRelay(client.relayClientId, { type: 'chat:info', username: info.username });
+        this.sendToRelay(client.relayClientId, { type: 'chat:info', username: info.username, adminKey: info.adminKey });
         break;
       }
     }
   }
 
   private handleWorkflowsList(client: VirtualClient): void {
-    const commands = loadWorkflowCommands();
-    const workflows = commands.map(c => ({ name: c.name, description: c.description, content: c.content }));
+    const sessionId = client.device.sessionId || 'default';
+    const workflows = this.onGetWorkflows
+      ? this.onGetWorkflows(sessionId)
+      : loadWorkflowCommands().map(c => ({ name: c.name, description: c.description, content: c.content }));
     console.log(`[iOS Relay] Sending ${workflows.length} workflows to ${client.device.deviceName}:`, workflows.map(w => w.name));
     this.sendToRelay(client.relayClientId, { type: 'workflows', workflows });
   }
@@ -921,6 +955,7 @@ export class iOSRelayClient {
         tokensUsed: result.tokensUsed,
         media: result.media,
         timestamp: new Date().toISOString(),
+        planPending: result.planPending,
       };
       this.sendToRelay(client.relayClientId, response);
     } catch (error) {

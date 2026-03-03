@@ -70,6 +70,7 @@ export interface ServerResponseMessage {
   tokensUsed?: number;
   media?: Array<{ type: string; filePath: string; mimeType: string }>;
   timestamp: string;
+  planPending?: boolean;
 }
 
 export interface ServerPairResultMessage {
@@ -121,7 +122,7 @@ export interface ConnectedDevice {
 export type iOSMessageHandler = (
   client: { device: ConnectedDevice },
   message: ClientChatMessage
-) => Promise<{ response: string; tokensUsed?: number; media?: Array<{ type: string; filePath: string; mimeType: string }> }>;
+) => Promise<{ response: string; tokensUsed?: number; media?: Array<{ type: string; filePath: string; mimeType: string }>; planPending?: boolean }>;
 
 export type iOSSessionsHandler = () => Array<{ id: string; name: string; updatedAt: string }>;
 
@@ -173,9 +174,24 @@ export type iOSSoulDeleteHandler = (id: number) => boolean;
 
 export type iOSFactsGraphHandler = () => Promise<{ nodes: Array<{ id: number; subject: string; category: string; content: string; group: number }>; links: Array<{ source: number; target: number; type: string; strength: number }> }>;
 
-export type iOSCustomizeGetHandler = () => { identity: string; instructions: string; profile?: { name: string; occupation: string; location: string; timezone: string; birthday: string; custom: string } };
+export type iOSCustomizeGetHandler = () => {
+  agentName: string;
+  personality: string;
+  goals: string;
+  struggles: string;
+  funFacts: string;
+  systemGuidelines: string;
+  profile?: { name: string; occupation: string; location: string; timezone: string; birthday: string };
+};
 
-export type iOSCustomizeSaveHandler = (identity?: string, instructions?: string, profile?: { name?: string; occupation?: string; location?: string; timezone?: string; birthday?: string; custom?: string }) => void;
+export type iOSCustomizeSaveHandler = (data: {
+  agentName?: string;
+  personality?: string;
+  goals?: string;
+  struggles?: string;
+  funFacts?: string;
+  profile?: { name?: string; occupation?: string; location?: string; timezone?: string; birthday?: string };
+}) => void;
 
 export type iOSRoutinesListHandler = () => Array<{ id: number; name: string; schedule_type?: string; schedule: string | null; run_at?: string | null; interval_ms?: number | null; prompt: string; channel: string; enabled: boolean; delete_after_run?: boolean; context_messages?: number; next_run_at?: string | null; session_id?: string | null; job_type?: string }>;
 
@@ -190,6 +206,8 @@ export type iOSRoutinesRunHandler = (name: string) => Promise<{ success: boolean
 export type iOSAppInfoHandler = () => { version: string; name: string };
 
 export type iOSModeGetHandler = (sessionId: string) => { mode: string; locked: boolean };
+
+export type iOSWorkflowsHandler = (sessionId: string) => Array<{ name: string; description: string; content: string }>;
 
 export type iOSModeSwitchHandler = (sessionId: string, mode: string) => { mode: string; locked: boolean; error?: string };
 
